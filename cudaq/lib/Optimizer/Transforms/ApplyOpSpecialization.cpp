@@ -1282,7 +1282,6 @@ public:
 
         OperationState res(op->getLoc(), op->getName().getStringRef(), operands,
                            op->getResultTypes(), attrs);
-        // FIXME: Quake quantum gates do have results.
         auto *newOp = builder.create(res);
         op->replaceAllUsesWith(newOp->getResults());
         op->erase();
@@ -1404,9 +1403,22 @@ public:
       newFunc->setAttr(cudaq::cc::atomicQuantumRegionAttrName, atomicRegion);
     IRMapping mapping;
     funcBody.cloneInto(&newFunc.getBody(), mapping);
-    if (failed(reverseTheOpsInTheBlock</*checkEmpty=*/true>(
-            loc, newFunc.getBody().front().getTerminator(),
-            getOpsToInvert(newFunc.getBody().front()), newApplyOps))) {
+    auto &newBody = newFunc.getBody().front();
+    const bool hasWireSignature =
+        llvm::any_of(
+            funcTy.getInputs(),
+            [](Type type) { return isa<cudaq::quake::WireType>(type); }) ||
+        llvm::any_of(funcTy.getResults(), [](Type type) {
+          return isa<cudaq::quake::WireType>(type);
+        });
+    if (hasWireSignature) {
+      if (failed(reverseWireOpsInTheBlock(loc, newBody))) {
+        newFunc.erase();
+        return failure();
+      }
+    } else if (failed(reverseTheOpsInTheBlock</*checkEmpty=*/true>(
+                   loc, newBody.getTerminator(), getOpsToInvert(newBody),
+                   newApplyOps))) {
       if (legacyClassical)
         return failure();
       return func.emitOpError("auto-generation of adjoint " + funcName +
@@ -1424,6 +1436,110 @@ public:
       if (cudaq::opt::hasQuantum(op) || cudaq::opt::hasCallOp(op))
         ops.push_back(&op);
     return ops;
+  }
+
+  /// Reverse a straight-line value-semantics quantum dataflow block.
+  ///
+  /// A wire result is the post-operation incarnation of the corresponding
+  /// wire operand. Reversing the operations therefore threads values from the
+  /// function results back toward its wire arguments. Reference-semantics
+  /// kernels do not need this bookkeeping.
+  static LogicalResult reverseWireOpsInTheBlock(Location loc, Block &block) {
+    auto *term = block.getTerminator();
+    SmallVector<BlockArgument> wireArguments;
+    for (BlockArgument argument : block.getArguments())
+      if (isa<cudaq::quake::WireType>(argument.getType()))
+        wireArguments.push_back(argument);
+
+    SmallVector<std::pair<unsigned, Value>> wireReturns;
+    for (auto [index, operand] : llvm::enumerate(term->getOperands()))
+      if (isa<cudaq::quake::WireType>(operand.getType()))
+        wireReturns.emplace_back(index, operand);
+
+    if (wireArguments.size() != wireReturns.size()) {
+      term->emitError("cannot create an adjoint for a wire kernel whose "
+                      "wire argument and result counts differ");
+      return failure();
+    }
+
+    DenseMap<Value, Value> inverseWires;
+    for (auto [argument, indexedResult] :
+         llvm::zip(wireArguments, wireReturns)) {
+      inverseWires[indexedResult.second] = argument;
+      // Drop the old dataflow use before erasing its defining gate.
+      term->setOperand(indexedResult.first, argument);
+    }
+
+    auto invertedOps = getOpsToInvert(block);
+    OpBuilder builder(term);
+    for (Operation *op : llvm::reverse(invertedOps)) {
+      if (op->getNumRegions() != 0 || isa<cudaq::quake::ApplyOp>(op)) {
+        op->emitError("wire adjoint specialization currently requires "
+                      "straight-line Quake gates");
+        return failure();
+      }
+
+      auto quantumOp = dyn_cast<cudaq::quake::OperatorInterface>(op);
+      if (!quantumOp) {
+        op->emitError("unsupported operation in wire adjoint specialization");
+        return failure();
+      }
+
+      auto wireOperands = cudaq::quake::getWireValues(quantumOp.getControls(),
+                                                      quantumOp.getTargets());
+      if (wireOperands.size() != op->getNumResults()) {
+        op->emitError("wire gate result count does not match its operands");
+        return failure();
+      }
+
+      IRMapping mapper;
+      for (auto [operand, result] : llvm::zip(wireOperands, op->getResults())) {
+        auto current = inverseWires.find(result);
+        if (current == inverseWires.end()) {
+          op->emitError("wire result does not form linear quantum dataflow");
+          return failure();
+        }
+        mapper.map(operand, current->second);
+      }
+
+      // quake.phase is scalar bookkeeping rather than a physical operator;
+      // its inverse is represented by negating its single angle. Physical
+      // parameterized gates, however, must retain their parameter ordering and
+      // toggle the adjoint marker (not negate every parameter: that is wrong
+      // for gates such as U3 and PhasedRx).
+      const bool isPhase = isa<cudaq::quake::PhaseOp>(op);
+      if (isPhase) {
+        auto arrAttr = cast<DenseI32ArrayAttr>(
+            op->getAttr(cudaq::runtime::operandSegmentSizes));
+        for (Value parameter : op->getOperands().take_front(arrAttr[0]))
+          mapper.map(parameter,
+                     arith::NegFOp::create(builder, loc, parameter.getType(),
+                                           parameter));
+      }
+
+      Operation *newOp = builder.clone(*op, mapper);
+      if (!quantumOp->hasTrait<cudaq::Hermitian>() && !isPhase) {
+        if (newOp->hasAttr("is_adj"))
+          newOp->removeAttr("is_adj");
+        else
+          newOp->setAttr("is_adj", builder.getUnitAttr());
+      }
+      for (auto [operand, result] :
+           llvm::zip(wireOperands, newOp->getResults()))
+        inverseWires[operand] = result;
+      op->erase();
+    }
+
+    for (auto [argument, indexedResult] :
+         llvm::zip(wireArguments, wireReturns)) {
+      auto result = inverseWires.find(argument);
+      if (result == inverseWires.end()) {
+        term->emitError("wire argument is not returned by adjoint dataflow");
+        return failure();
+      }
+      term->setOperand(indexedResult.first, result->second);
+    }
+    return success();
   }
 
   static Value cloneRootSubexpression(OpBuilder &builder, Block &block,
@@ -1704,11 +1820,12 @@ public:
         UnitAttr newIsAdj = applyOp.getIsAdj()
                                 ? UnitAttr{}
                                 : UnitAttr::get(builder.getContext());
-        [[maybe_unused]] auto newCall = cudaq::quake::ApplyOp::create(
+        auto newApply = cudaq::quake::ApplyOp::create(
             builder, applyOp.getLoc(), applyOp.getResultTypes(),
             applyOp.getCalleeAttr(), newIsAdj, applyOp.getControls(),
             applyOp.getActuals());
-        LLVM_DEBUG(llvm::dbgs() << "toggled as: " << newCall << ".\n");
+        applyOp->replaceAllUsesWith(newApply.getResults());
+        LLVM_DEBUG(llvm::dbgs() << "toggled as: " << newApply << ".\n");
         applyOp->erase();
         continue;
       }
@@ -1754,8 +1871,8 @@ public:
           op->setAttr("is_adj", builder.getUnitAttr());
       }
 
-      [[maybe_unused]] auto *newOp = builder.clone(*op, mapper);
-      assert(newOp->getNumResults() == 0);
+      auto *newOp = builder.clone(*op, mapper);
+      op->replaceAllUsesWith(newOp->getResults());
       op->erase();
     }
     return success();
