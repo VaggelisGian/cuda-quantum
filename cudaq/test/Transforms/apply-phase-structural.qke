@@ -23,7 +23,7 @@ func.func private @phase_leaf(%theta: f64, %negative: !quake.ref,
 
 func.func private @phase_middle(%theta: f64, %negative: !quake.ref,
                                 %anchor: !quake.ref) {
-  quake.apply @phase_leaf %theta, %negative, %anchor
+  quake.apply @phase_leaf (%theta, %negative, %anchor)
       : (f64, !quake.ref, !quake.ref) -> ()
   return
 }
@@ -32,7 +32,7 @@ func.func @nested_caller(%theta: f64, %outer0: !quake.ref,
                          %outer1: !quake.ref, %negative: !quake.ref,
                          %anchor: !quake.ref) {
   quake.apply<adj> @phase_middle [%outer0, %outer1]
-      %theta, %negative, %anchor
+      (%theta, %negative, %anchor)
       : (!quake.ref, !quake.ref, f64, !quake.ref, !quake.ref) -> ()
   return
 }
@@ -61,7 +61,7 @@ func.func private @structured_phase(%theta: f64, %condition: i1,
 
 func.func @structured_caller(%theta: f64, %condition: i1,
                              %count: i32, %anchor: !quake.ref) {
-  quake.apply<adj> @structured_phase %theta, %condition, %count, %anchor
+  quake.apply<adj> @structured_phase (%theta, %condition, %count, %anchor)
       : (f64, i1, i32, !quake.ref) -> ()
   return
 }
@@ -70,7 +70,7 @@ func.func private @recursive_phase(%theta: f64, %recurse: i1,
                                    %anchor: !quake.ref) {
   quake.phase (%theta) %anchor : (f64, !quake.ref) -> ()
   cc.if(%recurse) {
-    quake.apply @recursive_phase %theta, %recurse, %anchor
+    quake.apply @recursive_phase (%theta, %recurse, %anchor)
         : (f64, i1, !quake.ref) -> ()
   }
   return
@@ -78,7 +78,7 @@ func.func private @recursive_phase(%theta: f64, %recurse: i1,
 
 func.func @recursive_caller(%theta: f64, %recurse: i1,
                             %outer: !quake.ref, %anchor: !quake.ref) {
-  quake.apply @recursive_phase [%outer] %theta, %recurse, %anchor
+  quake.apply @recursive_phase [%outer] (%theta, %recurse, %anchor)
       : (!quake.ref, f64, i1, !quake.ref) -> ()
   return
 }

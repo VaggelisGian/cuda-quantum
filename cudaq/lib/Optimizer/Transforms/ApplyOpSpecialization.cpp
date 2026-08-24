@@ -739,9 +739,9 @@ buildCtrlClosureInstantiation(
     for (unsigned i = formalArgsStart, n = entry->getNumArguments(); i < n; ++i)
       callArgs.push_back(entry->getArgument(i));
 
-    func::CallOp::create(rewriter, loc, origFnSig.getResults(), innerCtrlAttr,
-                         callArgs);
-    func::ReturnOp::create(rewriter, loc, ValueRange{});
+    auto call = func::CallOp::create(rewriter, loc, origFnSig.getResults(),
+                                     innerCtrlAttr, callArgs);
+    func::ReturnOp::create(rewriter, loc, call.getResults());
   }
 
   // New instantiate_callable: same external type, richer closure.
